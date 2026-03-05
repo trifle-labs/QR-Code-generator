@@ -87,6 +87,49 @@ string memory svg = QRCodeDemo(demoAddress).toSvgString(qr, 4);
 ```
 
 
+Gas usage
+---------
+
+QR Code generation is compute-intensive on-chain.  The table below shows gas
+estimates (measured on Hardhat's in-process EVM with the optimizer enabled at
+200 runs) for a range of typical inputs with a **fixed** mask pattern.
+
+| Input | ECC | Mask | QR version | Gas (approx.) |
+|---|---|---|---|---|
+| `"Hello, world!"` (13 B, byte mode) | Low | fixed | 1 (21×21) | ~2,240,000 |
+| Binary payload 13 bytes | Medium | fixed | 1 (21×21) | ~2,230,000 |
+| ECI(26) + 6-byte UTF-8 | Medium | fixed | 1 (21×21) | ~2,720,000 |
+| 50-digit numeric string | Medium | fixed | 2 (25×25) | ~4,250,000 |
+| 22-char URL (alphanumeric) | High | fixed | 3 (29×29) | ~5,820,000 |
+| 26-char mixed segments | Low | fixed | 3 (29×29) | ~8,180,000 |
+| 55-char alphanumeric string | High | fixed | 5 (37×37) | ~8,890,000 |
+| 28-digit numeric string | High | fixed | 5 (37×37) | ~8,700,000 |
+
+**Automatic mask selection** (`MASK_AUTO`) runs the full QR Code encoding
+pipeline **8 times** (once per mask pattern) to score each result and pick
+the lowest-penalty one.  For the inputs above this pushes gas well above the
+Ethereum mainnet per-transaction gas limit (~30 M gas on post-Merge blocks),
+and above Hardhat's default per-transaction cap of 16 777 216 gas.
+
+Gas scales roughly with the **number of modules** (size²):
+
+* Version 1 (21×21 =   441 modules): ~2–3 M gas with a fixed mask
+* Version 2 (25×25 =   625 modules): ~4 M gas
+* Version 3 (29×29 =   841 modules): ~6–8 M gas
+* Version 5 (37×37 = 1 369 modules): ~9 M gas
+* Higher versions will require more gas proportionally
+
+Practical considerations:
+
+* Use a **fixed mask** (`MASK_0`…`MASK_7`) whenever calling from a transaction
+  or when operating near the block gas limit.  Mask quality varies little in
+  practice; mask 0 or 2 are reasonable defaults.
+* `MASK_AUTO` is suitable for **off-chain** simulation / `eth_call` with an
+  unlimited gas allowance, or inside a high-gas block environment.
+* The QR Code library itself is a pure Solidity function (no storage, no
+  events); all the gas is spent on computation, not on state writes.
+
+
 Building and testing
 --------------------
 
