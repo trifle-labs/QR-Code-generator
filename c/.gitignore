@@ -1,0 +1,7 @@
+# Build outputs
+*.o
+*.a
+*.d
+.deps/
+qrcodegen-demo
+qrcodegen-test
