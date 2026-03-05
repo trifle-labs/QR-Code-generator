@@ -1,0 +1,23 @@
+{
+  "name": "qrcodegen-solidity",
+  "version": "1.0.0",
+  "description": "QR Code generator library — Solidity port",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "hardhat test",
+    "compile": "node scripts/compile.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "ethers": "^6.16.0",
+    "hardhat": "^2.28.6",
+    "solc": "^0.8.34"
+  }
+}
