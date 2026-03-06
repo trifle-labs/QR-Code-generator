@@ -90,42 +90,70 @@ string memory svg = QRCodeDemo(demoAddress).toSvgString(qr, 4);
 Gas usage
 ---------
 
-QR Code generation is compute-intensive on-chain.  The table below shows gas
+QR Code generation is compute-intensive on-chain.  The tables below show gas
 estimates (measured on Hardhat's in-process EVM with the optimizer enabled at
-200 runs) for a range of typical inputs with a **fixed** mask pattern.
+200 runs) for a range of typical inputs.
 
-| Input | ECC | Mask | QR version | Gas (approx.) |
+The current implementation applies three EVM-native optimisations over the
+original C-port baseline: pre-computed `bytes constant` lookup tables for
+GF(256) exp/log and ECC block data; `uint256` row packing for the internal
+module grid (whole-row XOR/OR instead of per-module bit manipulation); and
+Yul inline assembly for the Reed-Solomon inner loop and penalty-scoring hot
+paths.  The result is roughly a **55–62% reduction** in gas across all inputs.
+
+### Fixed mask (recommended for on-chain transactions)
+
+| Input | ECC | Mask | QR version | Gas |
 |---|---|---|---|---|
-| `"Hello, world!"` (13 B, byte mode) | Low | fixed | 1 (21×21) | ~2,240,000 |
-| Binary payload 13 bytes | Medium | fixed | 1 (21×21) | ~2,230,000 |
-| ECI(26) + 6-byte UTF-8 | Medium | fixed | 1 (21×21) | ~2,720,000 |
-| 50-digit numeric string | Medium | fixed | 2 (25×25) | ~4,250,000 |
-| 22-char URL (alphanumeric) | High | fixed | 3 (29×29) | ~5,820,000 |
-| 26-char mixed segments | Low | fixed | 3 (29×29) | ~8,180,000 |
-| 55-char alphanumeric string | High | fixed | 5 (37×37) | ~8,890,000 |
-| 28-digit numeric string | High | fixed | 5 (37×37) | ~8,700,000 |
+| `"Hello, world!"` (13 B, byte mode) | Low | 2 | 1 (21×21) | ~930,000 |
+| Binary payload 13 bytes | Medium | 0 | 1 (21×21) | ~928,000 |
+| ECI(26) + 6-byte UTF-8 | Medium | 0 | 1 (21×21) | ~1,227,000 |
+| 50-digit numeric string | Medium | 3 | 2 (25×25) | ~1,728,000 |
+| 22-char URL (alphanumeric mode) | High | — | 3 (29×29) | ~2,397,000 |
+| 26-char mixed segments | Low | 0 | 3 (29×29) | ~3,276,000 |
+| 28-digit numeric string | High | 2 | 5 (37×37) | ~3,337,000 |
+| 55-char alphanumeric string | High | — | 5 (37×37) | ~3,594,000 |
 
-**Automatic mask selection** (`MASK_AUTO`) runs the full QR Code encoding
-pipeline **8 times** (once per mask pattern) to score each result and pick
-the lowest-penalty one.  For the inputs above this pushes gas well above the
-Ethereum mainnet per-transaction gas limit (~30 M gas on post-Merge blocks),
-and above Hardhat's default per-transaction cap of 16 777 216 gas.
+### Automatic mask selection (`MASK_AUTO`)
 
-Gas scales roughly with the **number of modules** (size²):
+`MASK_AUTO` runs the full encoding pipeline 8 times to score each mask and
+pick the lowest-penalty one.  Gas is roughly 5–6× the fixed-mask cost:
 
-* Version 1 (21×21 =   441 modules): ~2–3 M gas with a fixed mask
-* Version 2 (25×25 =   625 modules): ~4 M gas
-* Version 3 (29×29 =   841 modules): ~6–8 M gas
-* Version 5 (37×37 = 1 369 modules): ~9 M gas
-* Higher versions will require more gas proportionally
+| Input | QR version | Gas |
+|---|---|---|
+| `"Hello, world!"` (byte mode) | 1 (21×21) | ~5,291,000 |
+| Binary payload 13 bytes | 1 (21×21) | ~5,290,000 |
+| ECI(26) + 6-byte UTF-8 | 1 (21×21) | ~5,591,000 |
+| 50-digit numeric string | 2 (25×25) | ~7,698,000 |
+| 26-char mixed segments | 3 (29×29) | ~11,121,000 |
+| 55-char alphanumeric string | 5 (37×37) | ~15,741,000 |
+
+All `MASK_AUTO` cases now fit comfortably within Ethereum mainnet's 30 M gas
+block limit (previously they exceeded it for versions ≥ 2).
+
+### SVG rendering
+
+`QRCodeDemo.toSvgString(qr, border)` costs approximately **2,356,000 gas**
+for a version-1 QR Code with a 4-module quiet-zone border.
+
+### Gas scaling by version
+
+Gas scales with the number of modules (size²) of the QR Code:
+
+* Version 1 (21×21 =   441 modules): ~930 k gas (fixed mask)
+* Version 2 (25×25 =   625 modules): ~1.7 M gas
+* Version 3 (29×29 =   841 modules): ~2.4–3.3 M gas
+* Version 5 (37×37 = 1 369 modules): ~3.3–3.6 M gas
+* Higher versions scale proportionally
 
 Practical considerations:
 
 * Use a **fixed mask** (`MASK_0`…`MASK_7`) whenever calling from a transaction
   or when operating near the block gas limit.  Mask quality varies little in
-  practice; mask 0 or 2 are reasonable defaults.
-* `MASK_AUTO` is suitable for **off-chain** simulation / `eth_call` with an
-  unlimited gas allowance, or inside a high-gas block environment.
+  practice; `MASK_0` or `MASK_2` are reasonable defaults.
+* `MASK_AUTO` is now feasible for on-chain transactions through version 5
+  (all cases are below 30 M gas), and is always suitable for off-chain
+  `eth_call` simulation with an unlimited gas allowance.
 * The QR Code library itself is a pure Solidity function (no storage, no
   events); all the gas is spent on computation, not on state writes.
 
