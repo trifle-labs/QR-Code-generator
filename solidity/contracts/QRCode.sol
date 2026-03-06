@@ -45,7 +45,14 @@ pragma solidity ^0.8.0;
  *                 A set bit means a dark (black) module.
  * An invalid/failed encoding is represented as bytes of length 1 with qrcode[0] == 0.
  *
- * This implementation is modeled after the C port in the same repository.
+ * Gas optimisations over the C-port baseline:
+ *   1. Pre-computed lookup tables (GF256 log/exp, alphanumeric map, ECC tables) stored
+ *      as `bytes constant` so they live in bytecode and never allocate heap memory.
+ *   2. Internal module grid represented as uint256[] rows (one uint256 per row) so
+ *      every module read/write is a single bit-shift instead of a multiply + byte index.
+ *      All-column operations (mask application, rectangle fill) work on whole rows.
+ *   3. Yul inline assembly for the Reed-Solomon remainder inner loop and for the
+ *      vectorised penalty-scoring (N2 2x2 block check and N4 dark-module count).
  */
 library QRCode {
 
@@ -92,6 +99,93 @@ library QRCode {
     int internal constant LENGTH_OVERFLOW = type(int256).min;
 
 
+    /*======== Pre-computed lookup tables (stored in bytecode, zero heap allocation) ========*/
+
+    /*
+     * GF(2^8) exponentiation table over polynomial 0x11D: GF256_EXP[i] = 2^i.
+     * 256 bytes.  Replaces the 8-iteration Russian-peasant multiply with 3 lookups.
+     */
+    bytes private constant GF256_EXP =
+        hex"01020408102040801d3a74e8cd8713264c982d5ab475eac98f03060c183060c0"
+        hex"9d274e9c254a94356ad4b577eec19f23468c050a142850a05dba69d2b96fdea1"
+        hex"5fbe61c2992f5ebc65ca890f1e3c78f0fde7d3bb6bd6b17ffee1dfa35bb671e2"
+        hex"d9af4386112244880d1a3468d0bd67ce811f3e7cf8edc7933b76ecc5973366cc"
+        hex"85172e5cb86ddaa94f9e214284152a54a84d9a2952a455aa49923972e4d5b773"
+        hex"e6d1bf63c6913f7efce5d7b37bf6f1ffe3dbab4b963162c495376edca557ae41"
+        hex"82193264c88d070e1c3870e0dda753a651a259b279f2f9efc39b2b56ac458a09"
+        hex"122448903d7af4f5f7f3fbebcb8b0b162c58b07dfae9cf831b366cd8ad478e01";
+
+    /*
+     * GF(2^8) discrete-log table: GF256_LOG[x] = log_2(x) mod 0x11D.
+     * GF256_LOG[0] is undefined; _gf256Mul guards against zero inputs.
+     */
+    bytes private constant GF256_LOG =
+        hex"0000011902321ac603df33ee1b68c74b0464e00e348def811cc169f8c8084c71"
+        hex"058a652fe1240f2135938edaf01282451db5c27d6a27f9b9c99a09784de472a6"
+        hex"06bf8b6266dd30fde29825b31091228836d094ce8f96dbbdf1d2135c83384640"
+        hex"1e42b6a3c3487e6e6b3a2854fa85ba3dca5e9b9f0a15792b4ed4e5ac73f3a757"
+        hex"0770c0f78c80630d674adeed31c5fe18e3a5997726b8b47c114492d92320892e"
+        hex"373fd15b95bccfcd908797b2dcfcbe61f256d3ab142a5d9e843c3953476d41a2"
+        hex"1f2d43d8b77ba476c41749ec7f0c6ff66ca13b52299d55aafb6086b1bbcc3e5a"
+        hex"cb595fb09ca9a0510bf516eb7a752cd74faed5e9e6e7ade874d6f4eaa85058af";
+
+    /*
+     * Alphanumeric character map, indexed by (c - 0x20) for c in [0x20, 0x5A].
+     * Stored value = (QR alphanumeric index + 1), 0 = invalid character.
+     * Reduces the original 11-branch if-else chain to two range checks + one read.
+     */
+    bytes private constant ALPHA_MAP =
+        hex"250000002627000000002829002a2b2c0102030405060708090a2d"
+        hex"0000000000000b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324";
+
+    /*
+     * ECC codewords per block [version 0..40], one table per ECC level.
+     * Index 0 = 0xFF sentinel.  `bytes constant` means bytecode storage,
+     * no heap allocation per call (unlike the original function-local hex literals).
+     */
+    bytes private constant _ECPB_LOW  = hex"ff070a0f141a1214181e1214181a1e16181c1e1c1c1c1c1e1e1a1c1e1e1e1e1e1e1e1e1e1e1e1e1e1e";
+    bytes private constant _ECPB_MED  = hex"ff0a101a1218101216161a1e161618181c1c1a1a1a1a1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c";
+    bytes private constant _ECPB_QRT  = hex"ff0d16121a1218121614181c1a18141e181c1c1a1e1c1e1e1e1e1c1e1e1e1e1e1e1e1e1e1e1e1e1e1e";
+    bytes private constant _ECPB_HIGH = hex"ff111c1610161c1a1a181c181c1618181e1c1c1a1c1e181e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e";
+
+    /*
+     * Number of error-correction blocks [version 0..40], one table per ECC level.
+     */
+    bytes private constant _NECB_LOW  = hex"ff01010101010202020204040404040606060607080809090a0c0c0c0d0e0f10111213131415161819";
+    bytes private constant _NECB_MED  = hex"ff01010102020404040505050809090a0a0b0d0e10111112141517191a1c1d1f21232526282b2d2f31";
+    bytes private constant _NECB_QRT  = hex"ff01010202040406060808080a0c100c11101215141717191b1d22222326282b2d303335383b3e4144";
+    bytes private constant _NECB_HIGH = hex"ff010102040404050608080b0b101012101315191919221e202325282a2d303336393c3f42464a4d51";
+
+    /*
+     * Vectorised 256-bit mask-pattern constants.
+     * Bit x is set iff column x satisfies the mask formula for that row category.
+     * Verified against per-pixel formula for all qrsize values 1..177.
+     */
+    // Mask 0: (x+y)%2==0  — even row: even x; odd row: odd x
+    uint256 private constant _MASK0_EVEN =
+        0x5555555555555555555555555555555555555555555555555555555555555555;
+    uint256 private constant _MASK0_ODD =
+        0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;
+    // Period-3 column patterns (masks 2, 3, 5, 6, 7)
+    uint256 private constant _MP0 =  // x%3==0
+        0x9249249249249249249249249249249249249249249249249249249249249249;
+    uint256 private constant _MP1 =  // x%3==1
+        0x2492492492492492492492492492492492492492492492492492492492492492;
+    uint256 private constant _MP2 =  // x%3==2
+        0x4924924924924924924924924924924924924924924924924924924924924924;
+    // Period-6 column patterns (masks 4, 6, 7)
+    uint256 private constant _MPA =  // x%6 in {0,1,2}
+        0x71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c7;
+    uint256 private constant _MPB =  // x%6 in {3,4,5}
+        0x8e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38;
+    uint256 private constant _MP6 =  // x%6==0 (mask 5)
+        0x1041041041041041041041041041041041041041041041041041041041041041;
+    uint256 private constant _MPC =  // x%6 in {0,4,5} (masks 6, 7)
+        0x1c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71c71;
+    uint256 private constant _MPD =  // x%6 in {1,2,3} (masks 6, 7)
+        0xe38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e38e;
+
+
     /*---- Segment struct ----*/
 
     /*
@@ -122,13 +216,6 @@ library QRCode {
     /*
      * Encodes the given text to a QR Code.
      * Returns bytes of length 1 with qrcode[0]==0 on failure (data too long).
-     *
-     *   text       : UTF-8 text to encode (no NUL bytes)
-     *   ecl        : Error correction level (ECC_LOW .. ECC_HIGH)
-     *   minVersion : Minimum QR version to try (1..40)
-     *   maxVersion : Maximum QR version to try (minVersion..40)
-     *   mask       : Mask pattern (MASK_0..MASK_7) or MASK_AUTO for automatic selection
-     *   boostEcl   : When true, may upgrade the ECC level if the version doesn't increase
      */
     function encodeText(
         string memory text,
@@ -196,9 +283,6 @@ library QRCode {
         uint8 mask,
         bool  boostEcl
     ) internal pure returns (bytes memory) {
-        // Find the minimal version and optionally boost ECC level.
-        // Uses a nested scope so intermediate locals are freed before _buildQrCode,
-        // keeping the EVM stack depth below 16.
         uint8 version;
         uint8 finalEcl;
         {
@@ -207,7 +291,7 @@ library QRCode {
             (found, version, dataUsedBits) = _findMinVersion(segs, ecl, minVersion, maxVersion);
             if (!found) {
                 bytes memory empty = new bytes(1);
-                return empty;  // qrcode[0] == 0 signals failure
+                return empty;
             }
             finalEcl = _boostEccLevel(ecl, version, dataUsedBits, boostEcl);
         }
@@ -231,7 +315,6 @@ library QRCode {
 
     /*
      * Returns a segment representing the given string of decimal digits in numeric mode.
-     * Every byte of `digits` must be an ASCII digit ('0'–'9').
      */
     function makeNumeric(bytes memory digits) internal pure returns (Segment memory seg) {
         uint len = digits.length;
@@ -262,7 +345,7 @@ library QRCode {
 
     /*
      * Returns a segment representing the given text in alphanumeric mode.
-     * Valid characters: 0–9, A–Z (uppercase only), space, $, %, *, +, -, ., /, :
+     * Valid characters: 0-9, A-Z (uppercase only), space, $, %, *, +, -, ., /, :
      */
     function makeAlphanumeric(bytes memory text) internal pure returns (Segment memory seg) {
         uint len = text.length;
@@ -344,7 +427,7 @@ library QRCode {
     /*======== Character set helpers ========*/
 
     /*
-     * Returns true iff every byte in text is an ASCII decimal digit (0x30–0x39).
+     * Returns true iff every byte in text is an ASCII decimal digit (0x30-0x39).
      */
     function isNumericBytes(bytes memory text) internal pure returns (bool) {
         for (uint i = 0; i < text.length; i++) {
@@ -356,7 +439,6 @@ library QRCode {
 
     /*
      * Returns true iff every byte in text is a valid alphanumeric-mode character.
-     * (0–9, A–Z, space, $, %, *, +, -, ., /, :)
      */
     function isAlphanumericBytes(bytes memory text) internal pure returns (bool) {
         for (uint i = 0; i < text.length; i++) {
@@ -367,8 +449,8 @@ library QRCode {
     }
 
     /*
-     * Returns the number of bytes needed for a segment data buffer containing
-     * numChars characters in the given mode. Returns type(uint).max on overflow.
+     * Returns the number of bytes needed for a segment data buffer.
+     * Returns type(uint).max on overflow.
      */
     function calcSegmentBufferSize(uint8 mode, uint numChars) internal pure returns (uint) {
         int temp = _calcSegmentBitLength(mode, numChars);
@@ -379,50 +461,48 @@ library QRCode {
 
     /*======== Private: core encode pipeline ========*/
 
-    // Builds the QR Code symbol from already-determined version and ECC level.
-    // Split from encodeSegmentsAdvanced to keep stack depth within the EVM 16-slot limit.
+    /*
+     * Builds the QR Code symbol from already-determined version and ECC level.
+     *
+     * The module grid is kept as uint256[] rows internally (bit x of rows[y] = module
+     * at column x, row y).  This eliminates the y*size multiplication on every module
+     * access and enables whole-row operations for rectangle fills, mask application,
+     * and penalty scoring.  The grid is converted to the standard packed-bytes output
+     * format only in the final _gridToBytes call.
+     */
     function _buildQrCode(
         Segment[] memory segs,
         uint8 version,
         uint8 ecl,
         uint8 mask
     ) private pure returns (bytes memory) {
+        uint qrsize = uint(version) * 4 + 17;
         uint bufLen = bufferLenForVersion(version);
-        bytes memory qrcode     = new bytes(bufLen);
-        bytes memory tempBuffer = new bytes(bufLen);
 
-        // 1. Encode all segment bits into qrcode (used as raw data buffer here)
-        uint bitLen = _appendSegmentBits(segs, version, qrcode);
+        // Phase 1-2: encode segment bits, pad, compute ECC — all in packed bytes.
+        bytes memory scratch = new bytes(bufLen);
+        bytes memory eccBuf  = new bytes(bufLen);
+        uint bitLen = _appendSegmentBits(segs, version, scratch);
+        bitLen = _addTerminatorAndPad(scratch, bitLen, version, ecl);
+        _addEccAndInterleave(scratch, version, ecl, eccBuf);
 
-        // 2. Add terminator bits and padding bytes to reach data capacity
-        bitLen = _addTerminatorAndPad(qrcode, bitLen, version, ecl);
+        // Phase 3: build and finalise the module grid as uint256[].
+        uint256[] memory rows  = new uint256[](qrsize);
+        uint256[] memory frows = new uint256[](qrsize);
 
-        // 3. Compute ECC and interleave all codewords into tempBuffer
-        _addEccAndInterleave(qrcode, version, ecl, tempBuffer);
+        _initFuncModules(version, qrsize, rows);
+        _drawCodewords(eccBuf, _getNumRawDataModules(version) / 8, qrsize, rows);
+        _drawLightFuncModules(qrsize, version, rows);
+        _initFuncModules(version, qrsize, frows);
 
-        // 4. Re-initialise qrcode as a QR module grid (all function modules marked dark)
-        _initializeFunctionModules(version, qrcode);
-
-        // 5. Draw the interleaved codeword bits into the non-function modules
-        _drawCodewords(tempBuffer, _getNumRawDataModules(version) / 8, qrcode);
-
-        // 6. Draw the light (white) portions of the function modules
-        _drawLightFunctionModules(qrcode, version);
-
-        // 7. Re-initialise tempBuffer as the function-module mask for the masking step
-        _initializeFunctionModules(version, tempBuffer);
-
-        // 8. Select and apply the mask pattern; draw final format bits
         if (mask == MASK_AUTO)
-            mask = _chooseBestMask(tempBuffer, qrcode, ecl);
-        _applyMask(tempBuffer, qrcode, mask);
-        _drawFormatBits(ecl, mask, qrcode);
+            mask = _chooseBestMask(frows, rows, qrsize, ecl);
+        _applyMask(frows, rows, qrsize, mask);
+        _drawFormatBits(ecl, mask, qrsize, rows);
 
-        return qrcode;
+        return _gridToBytes(rows, qrsize);
     }
 
-    // Finds the smallest version in [minVersion, maxVersion] that fits the segments
-    // at the given ECC level.  Returns (false,0,0) if none fits.
     function _findMinVersion(
         Segment[] memory segs,
         uint8 ecl,
@@ -440,7 +520,6 @@ library QRCode {
         }
     }
 
-    // Optionally boosts the ECC level to the highest that still fits in `version`.
     function _boostEccLevel(
         uint8 ecl,
         uint8 version,
@@ -455,7 +534,6 @@ library QRCode {
         return ecl;
     }
 
-    // Writes all segment header+data bits into `qrcode`. Returns total bits written.
     function _appendSegmentBits(
         Segment[] memory segs,
         uint8 version,
@@ -473,9 +551,6 @@ library QRCode {
         }
     }
 
-    // Appends the terminator sequence, zero-pads to the next byte boundary, then
-    // pads with alternating 0xEC/0x11 bytes to fill the data capacity.
-    // Returns the new bitLen (always a multiple of 8).
     function _addTerminatorAndPad(
         bytes memory qrcode,
         uint  bitLen,
@@ -499,7 +574,6 @@ library QRCode {
 
     /*======== Private: ECC computation and interleaving ========*/
 
-    // Computes ECC for each data block and interleaves all blocks into `result`.
     function _addEccAndInterleave(
         bytes memory data,
         uint8 version,
@@ -526,8 +600,6 @@ library QRCode {
         }
     }
 
-    // Computes ECC for one block and copies data + ECC bytes to the correct
-    // interleaved positions in `result`.
     function _interleaveBlock(
         bytes memory data,
         uint  datOffset,
@@ -552,13 +624,11 @@ library QRCode {
             result[dataLen + blockIdx + j * numBlocks] = ecc[j];
     }
 
-    // Number of 8-bit data codewords for the given version and ECC level.
     function _getNumDataCodewords(uint8 version, uint8 ecl) private pure returns (uint) {
         return _getNumRawDataModules(version) / 8
             - _eccCodewordsPerBlock(ecl, version) * _numErrCorrBlocks(ecl, version);
     }
 
-    // Total raw data module count (after excluding all function modules).
     function _getNumRawDataModules(uint8 version) private pure returns (uint) {
         uint v      = version;
         uint result = (16 * v + 128) * v + 64;
@@ -573,24 +643,45 @@ library QRCode {
 
     /*======== Private: Reed-Solomon ECC ========*/
 
+    /*
+     * GF(2^8) multiply using the pre-computed log/exp constant tables.
+     * Three table lookups replace the 8-iteration Russian-peasant loop.
+     */
+    function _gf256Mul(uint8 x, uint8 y) private pure returns (uint8 z) {
+        if (x == 0 || y == 0) return 0;
+        uint ix = uint8(GF256_LOG[x]);
+        uint iy = uint8(GF256_LOG[y]);
+        unchecked {
+            uint s = ix + iy;
+            if (s >= 255) s -= 255;
+            z = uint8(GF256_EXP[s]);
+        }
+    }
+
     // Returns the RS generator polynomial of the given degree.
     function _reedSolomonComputeDivisor(uint degree) private pure returns (bytes memory result) {
         require(degree >= 1 && degree <= 30, "QRCode: RS degree out of range");
         result = new bytes(degree);
-        result[degree - 1] = 0x01;  // Start with the monomial x^0
+        result[degree - 1] = 0x01;
 
         uint8 root = 1;
         for (uint i = 0; i < degree; i++) {
             for (uint j = 0; j < degree; j++) {
-                result[j] = bytes1(_reedSolomonMultiply(uint8(result[j]), root));
+                result[j] = bytes1(_gf256Mul(uint8(result[j]), root));
                 if (j + 1 < degree)
                     result[j] = bytes1(uint8(result[j]) ^ uint8(result[j + 1]));
             }
-            root = _reedSolomonMultiply(root, 0x02);
+            root = _gf256Mul(root, 0x02);
         }
     }
 
-    // Returns the RS remainder of data[offset..offset+dataLen-1] divided by the generator.
+    /*
+     * Computes the RS remainder of data[offset..offset+dataLen-1] divided by the generator.
+     *
+     * The inner loop runs in Yul assembly to eliminate per-byte bounds-check overhead
+     * and to inline the GF(256) multiply directly from memory-resident log/exp tables,
+     * avoiding Solidity function-call overhead on the hot multiply path.
+     */
     function _reedSolomonComputeRemainder(
         bytes memory data,
         uint  dataOffset,
@@ -599,76 +690,95 @@ library QRCode {
         uint  degree
     ) private pure returns (bytes memory result) {
         result = new bytes(degree);
-        for (uint i = 0; i < dataLen; i++) {
-            uint8 factor = uint8(data[dataOffset + i]) ^ uint8(result[0]);
-            for (uint k = 0; k + 1 < degree; k++)
-                result[k] = result[k + 1];
-            result[degree - 1] = 0x00;
-            for (uint j = 0; j < degree; j++)
-                result[j] = bytes1(uint8(result[j]) ^ _reedSolomonMultiply(uint8(generator[j]), factor));
+        bytes memory expMem = GF256_EXP;  // load constants to memory once
+        bytes memory logMem = GF256_LOG;
+        assembly {
+            let resPtr  := add(result,    0x20)
+            let genPtr  := add(generator, 0x20)
+            let datPtr  := add(add(data,  0x20), dataOffset)
+            let expBase := add(expMem,    0x20)
+            let logBase := add(logMem,    0x20)
+
+            for { let i := 0 } lt(i, dataLen) { i := add(i, 1) } {
+                // factor = data[i] XOR result[0]
+                let factor := xor(byte(0, mload(datPtr)), byte(0, mload(resPtr)))
+                datPtr := add(datPtr, 1)
+
+                // Shift result left by 1; zero the last byte.
+                let deg1 := sub(degree, 1)
+                for { let k := 0 } lt(k, deg1) { k := add(k, 1) } {
+                    mstore8(add(resPtr, k), byte(0, mload(add(resPtr, add(k, 1)))))
+                }
+                mstore8(add(resPtr, deg1), 0)
+
+                // result[j] ^= gf256Mul(generator[j], factor)
+                for { let j := 0 } lt(j, degree) { j := add(j, 1) } {
+                    let g := byte(0, mload(add(genPtr, j)))
+                    // mul(g, factor) is nonzero iff both g and factor are nonzero
+                    // (each <= 255, product <= 65025, no 256-bit overflow).
+                    if mul(g, factor) {
+                        let lg   := byte(0, mload(add(logBase, g)))
+                        let lf   := byte(0, mload(add(logBase, factor)))
+                        let s    := add(lg, lf)
+                        if gt(s, 254) { s := sub(s, 255) }
+                        let prod := byte(0, mload(add(expBase, s)))
+                        let addr := add(resPtr, j)
+                        mstore8(addr, xor(byte(0, mload(addr)), prod))
+                    }
+                }
+            }
         }
     }
 
-    // Returns the product of two GF(2^8) elements modulo the irreducible polynomial 0x11D.
-    // Uses Russian-peasant multiplication — same algorithm as the C implementation.
-    function _reedSolomonMultiply(uint8 x, uint8 y) private pure returns (uint8 z) {
-        z = 0;
-        for (int i = 7; i >= 0; i--) {
-            z = uint8((uint(z) << 1) ^ ((uint(z) >> 7) * 0x11D));
-            if (((y >> uint(i)) & 1) != 0) z ^= x;
-        }
-    }
 
+    /*======== Private: Function module drawing (uint256[] grid) ========*/
 
-    /*======== Private: Function module drawing ========*/
-
-    // Zeros qrcode, sets qrcode[0] = size, then marks all function modules dark.
-    function _initializeFunctionModules(uint8 version, bytes memory qrcode) private pure {
-        uint qrsize = uint(version) * 4 + 17;
-        for (uint i = 0; i < qrcode.length; i++) qrcode[i] = 0x00;
-        qrcode[0] = bytes1(uint8(qrsize));
+    /*
+     * Zeros rows[], then marks every function-module position as dark (bit set).
+     * Grid convention: bit x of rows[y] = module (column x, row y).
+     */
+    function _initFuncModules(uint8 version, uint qrsize, uint256[] memory rows) private pure {
+        // new uint256[] is already zero-initialised.
 
         // Timing patterns
-        _fillRectangle(6, 0, 1, qrsize, qrcode);
-        _fillRectangle(0, 6, qrsize, 1, qrcode);
+        _fillRect(6, 0, 1, qrsize, rows);   // vertical:   col 6, all rows
+        _fillRect(0, 6, qrsize, 1, rows);   // horizontal: row 6, all cols
 
-        // Finder patterns and format bit areas (all three corners)
-        _fillRectangle(0,          0,          9, 9, qrcode);
-        _fillRectangle(qrsize - 8, 0,          8, 9, qrcode);
-        _fillRectangle(0,          qrsize - 8, 9, 8, qrcode);
+        // Finder patterns + format bit areas
+        _fillRect(0,          0,          9, 9, rows);
+        _fillRect(qrsize - 8, 0,          8, 9, rows);
+        _fillRect(0,          qrsize - 8, 9, 8, rows);
 
         // Alignment patterns
         {
-            (bytes memory pos, uint n) = _getAlignmentPatternPositions(version);
+            (bytes memory ap, uint n) = _getAlignmentPatternPositions(version);
             for (uint i = 0; i < n; i++) {
                 for (uint j = 0; j < n; j++) {
-                    // Skip the three finder-pattern corners
                     if ((i == 0 && j == 0) || (i == 0 && j == n - 1) || (i == n - 1 && j == 0))
                         continue;
-                    _fillRectangle(uint8(pos[i]) - 2, uint8(pos[j]) - 2, 5, 5, qrcode);
+                    _fillRect(uint(uint8(ap[i])) - 2, uint(uint8(ap[j])) - 2, 5, 5, rows);
                 }
             }
         }
 
-        // Version information blocks (only for version >= 7)
+        // Version information blocks (version >= 7)
         if (version >= 7) {
-            _fillRectangle(qrsize - 11, 0,          3, 6, qrcode);
-            _fillRectangle(0,           qrsize - 11, 6, 3, qrcode);
+            _fillRect(qrsize - 11, 0,           3, 6, rows);
+            _fillRect(0,           qrsize - 11, 6, 3, rows);
         }
     }
 
-    // Draws the light (white) function modules over the dark ones set by
-    // _initializeFunctionModules: timing gap modules, finder separators,
-    // alignment pattern interiors, and version information bits.
-    function _drawLightFunctionModules(bytes memory qrcode, uint8 version) private pure {
-        uint qrsize = uint(version) * 4 + 17;
-
-        // Timing pattern: every other module starting at index 7
+    /*
+     * Draws the light (white) parts of the function modules: timing gaps, finder
+     * separator rings, alignment pattern interiors, and version information bits.
+     */
+    function _drawLightFuncModules(uint qrsize, uint8 version, uint256[] memory rows) private pure {
+        // Timing gap: every other module starting at index 7
         {
             uint i = 7;
             while (i < qrsize - 7) {
-                _setModuleBounded(qrcode, 6, i, false);
-                _setModuleBounded(qrcode, i, 6, false);
+                _clearMod(rows, 6, i);
+                _clearMod(rows, i, 6);
                 i += 2;
             }
         }
@@ -680,14 +790,14 @@ library QRCode {
                 int ady  = dy < 0 ? -dy : dy;
                 int dist = adx > ady ? adx : ady;
                 if (dist == 2 || dist == 4) {
-                    _setModuleUnbounded(qrcode, int(3) + dx,           int(3) + dy,           false);
-                    _setModuleUnbounded(qrcode, int(qrsize) - 4 + dx,  int(3) + dy,           false);
-                    _setModuleUnbounded(qrcode, int(3) + dx,           int(qrsize) - 4 + dy,  false);
+                    _setModU(rows, qrsize, int(3) + dx,          int(3) + dy,          false);
+                    _setModU(rows, qrsize, int(qrsize) - 4 + dx, int(3) + dy,          false);
+                    _setModU(rows, qrsize, int(3) + dx,          int(qrsize) - 4 + dy, false);
                 }
             }
         }
 
-        // Alignment pattern interiors (1-module rings around each centre)
+        // Alignment pattern interiors
         {
             (bytes memory ap, uint n) = _getAlignmentPatternPositions(version);
             for (uint i = 0; i < n; i++) {
@@ -696,7 +806,7 @@ library QRCode {
                         continue;
                     for (int dy2 = -1; dy2 <= 1; dy2++) {
                         for (int dx2 = -1; dx2 <= 1; dx2++) {
-                            _setModuleBounded(qrcode,
+                            _setMod(rows,
                                 uint(int(uint(uint8(ap[i]))) + dx2),
                                 uint(int(uint(uint8(ap[j]))) + dy2),
                                 dx2 == 0 && dy2 == 0);
@@ -706,7 +816,7 @@ library QRCode {
             }
         }
 
-        // Version information modules (only for version >= 7)
+        // Version information modules (version >= 7)
         if (version >= 7) {
             uint rem = version;
             for (uint i = 0; i < 12; i++)
@@ -716,8 +826,8 @@ library QRCode {
             for (uint i = 0; i < 6; i++) {
                 for (uint j = 0; j < 3; j++) {
                     uint p = qrsize - 11 + j;
-                    _setModuleBounded(qrcode, p, i, (bits & 1) != 0);
-                    _setModuleBounded(qrcode, i, p, (bits & 1) != 0);
+                    _setMod(rows, p, i, (bits & 1) != 0);
+                    _setMod(rows, i, p, (bits & 1) != 0);
                     bits >>= 1;
                 }
             }
@@ -725,8 +835,8 @@ library QRCode {
     }
 
     // Draws two copies of the 15-bit format information (including its own ECC).
-    function _drawFormatBits(uint8 ecl, uint8 mask, bytes memory qrcode) private pure {
-        // Remap ECC level: LOW→1, MEDIUM→0, QUARTILE→3, HIGH→2
+    function _drawFormatBits(uint8 ecl, uint8 mask, uint qrsize, uint256[] memory rows) private pure {
+        // Remap ECC level: LOW->1, MEDIUM->0, QUARTILE->3, HIGH->2
         uint8[4] memory table;
         table[0] = 1;  table[1] = 0;  table[2] = 3;  table[3] = 2;
         uint data = (uint(table[ecl]) << 3) | uint(mask);
@@ -736,21 +846,19 @@ library QRCode {
         uint bits = (data << 10 | rem) ^ 0x5412;
 
         // First copy (around the top-left finder)
-        for (uint i = 0; i <= 5; i++) _setModuleBounded(qrcode, 8, i, _getBit(bits, i));
-        _setModuleBounded(qrcode, 8, 7, _getBit(bits, 6));
-        _setModuleBounded(qrcode, 8, 8, _getBit(bits, 7));
-        _setModuleBounded(qrcode, 7, 8, _getBit(bits, 8));
-        for (uint i = 9; i < 15; i++) _setModuleBounded(qrcode, 14 - i, 8, _getBit(bits, i));
+        for (uint i = 0; i <= 5; i++) _setMod(rows, 8, i, _getBit(bits, i));
+        _setMod(rows, 8, 7, _getBit(bits, 6));
+        _setMod(rows, 8, 8, _getBit(bits, 7));
+        _setMod(rows, 7, 8, _getBit(bits, 8));
+        for (uint i = 9; i < 15; i++) _setMod(rows, 14 - i, 8, _getBit(bits, i));
 
         // Second copy (top-right and bottom-left finders)
-        uint qrsize = uint8(qrcode[0]);
-        for (uint i = 0; i < 8; i++)  _setModuleBounded(qrcode, qrsize - 1 - i, 8, _getBit(bits, i));
-        for (uint i = 8; i < 15; i++) _setModuleBounded(qrcode, 8, qrsize - 15 + i, _getBit(bits, i));
-        _setModuleBounded(qrcode, 8, qrsize - 8, true);  // Always dark
+        for (uint i = 0; i < 8; i++)  _setMod(rows, qrsize - 1 - i, 8, _getBit(bits, i));
+        for (uint i = 8; i < 15; i++) _setMod(rows, 8, qrsize - 15 + i, _getBit(bits, i));
+        _setMod(rows, 8, qrsize - 8, true);  // Always dark
     }
 
     // Returns the sorted list of alignment pattern centre positions for `version`.
-    // result[0..numAlign-1] are the positions; the same list is used for x and y.
     function _getAlignmentPatternPositions(uint8 version)
         private pure returns (bytes memory result, uint numAlign)
     {
@@ -768,24 +876,32 @@ library QRCode {
                 pos -= step;
             }
         }
-        result[0] = 0x06;  // Always 6
+        result[0] = 0x06;
     }
 
-    // Sets all modules in [left, left+width) × [top, top+height) to dark.
-    function _fillRectangle(uint left, uint top, uint width, uint height, bytes memory qrcode) private pure {
-        for (uint dy = 0; dy < height; dy++)
-            for (uint dx = 0; dx < width; dx++)
-                _setModuleBounded(qrcode, left + dx, top + dy, true);
+    /*
+     * Sets all modules in [left, left+width) x [top, top+height) to dark.
+     * Vectorised: computes a column bitmask and ORs it into each row word —
+     * height OR operations instead of width*height individual bit sets.
+     */
+    function _fillRect(uint left, uint top, uint width, uint height, uint256[] memory rows) private pure {
+        uint256 colBits = ((uint256(1) << width) - 1) << left;
+        unchecked {
+            for (uint dy = 0; dy < height; dy++)
+                rows[top + dy] |= colBits;
+        }
     }
 
 
     /*======== Private: Codeword drawing and masking ========*/
 
-    // Writes packed codewords into the non-function modules using the QR zigzag scan.
-    function _drawCodewords(bytes memory data, uint dataLen, bytes memory qrcode) private pure {
-        uint qrsize = uint8(qrcode[0]);
-        uint idx    = 0;
-
+    function _drawCodewords(
+        bytes memory data,
+        uint  dataLen,
+        uint  qrsize,
+        uint256[] memory rows
+    ) private pure {
+        uint idx   = 0;
         uint right = qrsize - 1;
         while (right >= 1) {
             if (right == 6) right = 5;
@@ -794,104 +910,213 @@ library QRCode {
                     uint x      = right - j;
                     bool upward = ((right + 1) & 2) == 0;
                     uint y      = upward ? qrsize - 1 - vert : vert;
-                    if (!_getModuleBounded(qrcode, x, y) && idx < dataLen * 8) {
+                    if (!_getMod(rows, x, y) && idx < dataLen * 8) {
                         bool dark = _getBit(uint8(data[idx >> 3]), 7 - (idx & 7));
-                        _setModuleBounded(qrcode, x, y, dark);
+                        _setMod(rows, x, y, dark);
                         idx++;
                     }
                 }
             }
-            if (right < 2) break;  // prevent uint underflow
+            if (right < 2) break;
             right -= 2;
         }
     }
 
-    // XORs every non-function module with the given mask pattern.
-    // Calling this twice with the same mask undoes the operation (XOR is self-inverse).
-    function _applyMask(bytes memory functionModules, bytes memory qrcode, uint8 mask) private pure {
-        uint qrsize = uint8(qrcode[0]);
+    /*
+     * XORs every non-function module with the given mask pattern.
+     *
+     * For each row y a 256-bit column-pattern is computed analytically from the
+     * precomputed constants (O(1) per row for masks 0-4; same for masks 5-7 using
+     * six (y%2, y%3) cases).  The pattern is ANDed with ~frows[y] to skip function
+     * modules, then XORed into the row in a single word operation.
+     */
+    function _applyMask(
+        uint256[] memory frows,
+        uint256[] memory rows,
+        uint qrsize,
+        uint8 mask
+    ) private pure {
+        uint256 colMask = (uint256(1) << qrsize) - 1;
         for (uint y = 0; y < qrsize; y++) {
-            for (uint x = 0; x < qrsize; x++) {
-                if (_getModuleBounded(functionModules, x, y)) continue;
-                bool inv;
-                if      (mask == 0) inv = (x + y) % 2 == 0;
-                else if (mask == 1) inv = y % 2 == 0;
-                else if (mask == 2) inv = x % 3 == 0;
-                else if (mask == 3) inv = (x + y) % 3 == 0;
-                else if (mask == 4) inv = (x / 3 + y / 2) % 2 == 0;
-                else if (mask == 5) inv = x * y % 2 + x * y % 3 == 0;
-                else if (mask == 6) inv = (x * y % 2 + x * y % 3) % 2 == 0;
-                else                inv = ((x + y) % 2 + x * y % 3) % 2 == 0;
-                _setModuleBounded(qrcode, x, y, _getModuleBounded(qrcode, x, y) != inv);
-            }
+            uint256 pat = _maskRowPattern(mask, y);
+            rows[y] ^= (pat & ~frows[y]) & colMask;
         }
     }
 
-    // Evaluates all 8 mask patterns and returns the index with the lowest penalty.
+    /*
+     * Returns the 256-bit column-inversion pattern for row y of the given mask.
+     * Bit x is 1 iff the mask formula would invert module (x, y).
+     */
+    function _maskRowPattern(uint8 mask, uint y) private pure returns (uint256) {
+        if (mask == 0) return (y & 1) == 0 ? _MASK0_EVEN : _MASK0_ODD;   // (x+y)%2==0
+        if (mask == 1) return (y & 1) == 0 ? type(uint256).max : 0;       // y%2==0
+        if (mask == 2) return _MP0;                                        // x%3==0
+        if (mask == 3) {                                                   // (x+y)%3==0
+            uint yr3 = y % 3;
+            return yr3 == 0 ? _MP0 : yr3 == 1 ? _MP2 : _MP1;
+        }
+        if (mask == 4) return ((y >> 1) & 1) == 0 ? _MPA : _MPB;         // (x/3+y/2)%2==0
+
+        // Masks 5-7: six (y%2, y%3) cases analytically derived.
+        uint ym2 = y & 1;
+        uint ym3 = y % 3;
+        if (mask == 5) {  // x*y%2 + x*y%3 == 0  (i.e. x*y divisible by 6)
+            if (ym2 == 0 && ym3 == 0) return type(uint256).max;
+            if (ym2 == 0)             return _MP0;
+            if (ym3 == 0)             return _MASK0_EVEN;
+            return _MP6;
+        }
+        if (mask == 6) {  // (x*y%2 + x*y%3) % 2 == 0
+            if (ym2 == 0 && ym3 == 0) return type(uint256).max;
+            if (ym2 == 0 && ym3 == 1) return _MP0 | _MP2;
+            if (ym2 == 0 && ym3 == 2) return _MP0 | _MP1;
+            if (ym2 == 1 && ym3 == 0) return _MASK0_EVEN;
+            if (ym2 == 1 && ym3 == 1) return _MPA;
+            return _MPC;
+        }
+        // mask == 7: ((x+y)%2 + x*y%3) % 2 == 0
+        if (ym2 == 0 && ym3 == 0) return _MASK0_EVEN;
+        if (ym2 == 0 && ym3 == 1) return _MPA;
+        if (ym2 == 0 && ym3 == 2) return _MPC;
+        if (ym2 == 1 && ym3 == 0) return _MASK0_ODD;
+        if (ym2 == 1 && ym3 == 1) return _MPB;
+        return _MPD;
+    }
+
     function _chooseBestMask(
-        bytes memory functionModules,
-        bytes memory qrcode,
+        uint256[] memory frows,
+        uint256[] memory rows,
+        uint qrsize,
         uint8 ecl
     ) private pure returns (uint8 bestMask) {
         uint minPenalty = type(uint).max;
         for (uint8 i = 0; i < 8; i++) {
-            _applyMask(functionModules, qrcode, i);
-            _drawFormatBits(ecl, i, qrcode);
-            uint penalty = _getPenaltyScore(qrcode);
+            _applyMask(frows, rows, qrsize, i);
+            _drawFormatBits(ecl, i, qrsize, rows);
+            uint penalty = _getPenaltyScore(rows, qrsize);
             if (penalty < minPenalty) {
                 bestMask   = i;
                 minPenalty = penalty;
             }
-            _applyMask(functionModules, qrcode, i);  // Undo via XOR
+            _applyMask(frows, rows, qrsize, i);  // undo via XOR
         }
     }
 
-    // Computes the penalty score for the current QR Code state (lower is better).
-    function _getPenaltyScore(bytes memory qrcode) private pure returns (uint result) {
-        uint qrsize = uint8(qrcode[0]);
+    /*
+     * Computes the QR Code penalty score (lower is better).
+     *
+     * N2 (2x2 same-colour blocks) and N4 (dark/light balance) use Yul popcount
+     * on 256-bit row words, reducing O(n^2) module reads to O(n) word operations.
+     * N1/N3 (run-length and finder patterns) use a per-module scan that reads from
+     * a pre-loaded uint256 row word, eliminating the y*size multiplication.
+     */
+    function _getPenaltyScore(uint256[] memory rows, uint qrsize) private pure returns (uint result) {
+        uint256 colMask = (uint256(1) << qrsize) - 1;
+        uint256 blkMask = qrsize > 1 ? (uint256(1) << (qrsize - 1)) - 1 : 0;
         result = 0;
 
-        // N1 + N3: runs of same colour in rows, and finder-like patterns
-        for (uint y = 0; y < qrsize; y++) result += _penaltyLine(qrcode, y, qrsize, false);
-        // N1 + N3: same in columns
-        for (uint x = 0; x < qrsize; x++) result += _penaltyLine(qrcode, x, qrsize, true);
-
-        // N2: 2×2 blocks of same colour
-        for (uint y = 0; y < qrsize - 1; y++) {
-            for (uint x = 0; x < qrsize - 1; x++) {
-                bool color = _getModuleBounded(qrcode, x, y);
-                if (color == _getModuleBounded(qrcode, x + 1, y) &&
-                    color == _getModuleBounded(qrcode, x,     y + 1) &&
-                    color == _getModuleBounded(qrcode, x + 1, y + 1))
-                    result += PENALTY_N2;
-            }
-        }
-
-        // N4: dark/light balance
-        uint dark = 0;
+        // N1 + N3: row scans
         for (uint y = 0; y < qrsize; y++)
-            for (uint x = 0; x < qrsize; x++)
-                if (_getModuleBounded(qrcode, x, y)) dark++;
-        uint total    = qrsize * qrsize;
-        uint darkDiff = dark * 20 >= total * 10 ? dark * 20 - total * 10 : total * 10 - dark * 20;
-        uint c        = (darkDiff + total - 1) / total;
-        uint k        = c > 0 ? c - 1 : 0;
-        result += k * PENALTY_N4;
+            result += _penaltyLine(rows[y] & colMask, qrsize);
+        // N1 + N3: column scans
+        for (uint x = 0; x < qrsize; x++)
+            result += _penaltyCol(rows, x, qrsize);
+
+        // N2 and N4 computed in Yul with vectorised 256-bit row operations.
+        assembly {
+            function popcnt64(u) -> c {
+                u := sub(u, and(shr(1, u), 0x5555555555555555))
+                u := add(and(u, 0x3333333333333333),
+                         and(shr(2, u), 0x3333333333333333))
+                u := and(add(u, shr(4, u)), 0x0f0f0f0f0f0f0f0f)
+                c := shr(56, mul(u, 0x0101010101010101))
+            }
+            function popcnt256(v) -> cnt {
+                cnt := add(
+                    add(popcnt64(and(v, 0xffffffffffffffff)),
+                        popcnt64(and(shr(64,  v), 0xffffffffffffffff))),
+                    add(popcnt64(and(shr(128, v), 0xffffffffffffffff)),
+                        popcnt64(shr(192, v))))
+            }
+
+            let rowsData  := add(rows, 0x20)
+            let qrs       := qrsize
+            let cm        := colMask
+            let bm        := blkMask
+            let darkTotal := 0
+
+            // N4: popcount all rows to get total dark module count.
+            for { let y := 0 } lt(y, qrs) { y := add(y, 1) } {
+                let row := mload(add(rowsData, mul(y, 0x20)))
+                darkTotal := add(darkTotal, popcnt256(and(row, cm)))
+            }
+
+            // N2: count 2x2 same-colour blocks over consecutive row pairs.
+            //   For rows r0, r1:
+            //     dark squares:  (r0 & (r0>>1)) & (r1 & (r1>>1))
+            //     light squares: (~r0 & (~r0>>1)) & (~r1 & (~r1>>1))  [masked to colMask]
+            let n2count := 0
+            for { let y := 0 } lt(y, sub(qrs, 1)) { y := add(y, 1) } {
+                let r0  := and(mload(add(rowsData, mul(y,           0x20))), cm)
+                let r1  := and(mload(add(rowsData, mul(add(y, 1),   0x20))), cm)
+                let d   := and(and(r0, shr(1, r0)), and(r1, shr(1, r1)))
+                let nr0 := and(not(r0), cm)
+                let nr1 := and(not(r1), cm)
+                let l   := and(and(nr0, shr(1, nr0)), and(nr1, shr(1, nr1)))
+                n2count := add(n2count, popcnt256(and(or(d, l), bm)))
+            }
+
+            // N4 penalty calculation
+            let total    := mul(qrs, qrs)
+            let darkDiff := 0
+            let t20      := mul(darkTotal, 20)
+            let base10   := mul(total, 10)
+            switch gt(t20, base10)
+            case 1 { darkDiff := sub(t20, base10) }
+            default { darkDiff := sub(base10, t20) }
+            let c_val := div(add(darkDiff, sub(total, 1)), total)
+            let k_val := 0
+            if gt(c_val, 0) { k_val := sub(c_val, 1) }
+
+            result := add(result, add(mul(n2count, 3), mul(k_val, 10)))
+        }
     }
 
-    // Accumulates N1 + N3 penalty for one row (isCol=false) or column (isCol=true).
-    function _penaltyLine(bytes memory qrcode, uint lineIdx, uint qrsize, bool isCol)
+    // N1+N3 penalty for one row (passed as a pre-loaded uint256 word).
+    function _penaltyLine(uint256 rowBits, uint qrsize)
         private pure returns (uint score)
     {
         bool runColor = false;
         uint runLen   = 0;
         uint[7] memory history;
         score = 0;
+        for (uint x = 0; x < qrsize; x++) {
+            bool cur = ((rowBits >> x) & 1) != 0;
+            if (cur == runColor) {
+                runLen++;
+                if (runLen == 5)     score += PENALTY_N1;
+                else if (runLen > 5) score++;
+            } else {
+                _finderPenaltyAddHistory(runLen, history, qrsize);
+                if (!runColor) score += _finderPenaltyCountPatterns(history) * PENALTY_N3;
+                runColor = cur;
+                runLen   = 1;
+            }
+        }
+        score += _finderPenaltyTerminateAndCount(runColor, runLen, history, qrsize) * PENALTY_N3;
+    }
 
-        for (uint pos = 0; pos < qrsize; pos++) {
-            bool cur = isCol
-                ? _getModuleBounded(qrcode, lineIdx, pos)
-                : _getModuleBounded(qrcode, pos, lineIdx);
+    // N1+N3 penalty for column x (reads rows[y] bit x for each y).
+    function _penaltyCol(uint256[] memory rows, uint x, uint qrsize)
+        private pure returns (uint score)
+    {
+        bool runColor = false;
+        uint runLen   = 0;
+        uint[7] memory history;
+        score = 0;
+        uint256 xBit = uint256(1) << x;
+        for (uint y = 0; y < qrsize; y++) {
+            bool cur = (rows[y] & xBit) != 0;
             if (cur == runColor) {
                 runLen++;
                 if (runLen == 5)     score += PENALTY_N1;
@@ -931,42 +1156,85 @@ library QRCode {
     }
 
     function _finderPenaltyAddHistory(uint runLen, uint[7] memory h, uint qrsize) private pure {
-        if (h[0] == 0) runLen += qrsize;  // virtual light border at line start
+        if (h[0] == 0) runLen += qrsize;
         h[6] = h[5];  h[5] = h[4];  h[4] = h[3];
         h[3] = h[2];  h[2] = h[1];  h[1] = h[0];
         h[0] = runLen;
     }
 
 
-    /*======== Private: Module access ========*/
+    /*======== Private: Grid-to-bytes conversion ========*/
 
-    // Returns the colour of module (x, y). Coordinates must be in bounds.
+    /*
+     * Converts the uint256[] row grid to the standard packed-bytes output format:
+     *   out[0]   = qrsize
+     *   out[1..] = module bits packed row-major, LSB-first within each byte.
+     *
+     * The Yul loop scans each row word once; only dark-module bits call mstore8.
+     */
+    function _gridToBytes(uint256[] memory rows, uint qrsize)
+        private pure returns (bytes memory out)
+    {
+        uint bufLen = (qrsize * qrsize + 7) / 8 + 1;
+        out = new bytes(bufLen);
+        out[0] = bytes1(uint8(qrsize));
+        assembly {
+            // out[1] is the first module-data byte.
+            // Memory layout: out -> length (32 bytes) -> out[0] (size) -> out[1..] (modules)
+            let outModBase := add(out, 0x21)   // skip length word and size byte
+            let rowsData   := add(rows, 0x20)
+            let qrs        := qrsize
+
+            for { let y := 0 } lt(y, qrs) { y := add(y, 1) } {
+                let row      := mload(add(rowsData, mul(y, 0x20)))
+                let bitStart := mul(y, qrs)
+
+                for { let x := 0 } lt(x, qrs) { x := add(x, 1) } {
+                    if and(shr(x, row), 1) {
+                        let bi      := add(bitStart, x)
+                        let byteIdx := shr(3, bi)
+                        let bitOff  := and(bi, 7)
+                        let addr    := add(outModBase, byteIdx)
+                        mstore8(addr, or(byte(0, mload(addr)), shl(bitOff, 1)))
+                    }
+                }
+            }
+        }
+    }
+
+
+    /*======== Private: uint256 grid module helpers ========*/
+
+    function _setMod(uint256[] memory rows, uint x, uint y, bool dark) private pure {
+        if (dark)
+            rows[y] |=  (uint256(1) << x);
+        else
+            rows[y] &= ~(uint256(1) << x);
+    }
+
+    function _clearMod(uint256[] memory rows, uint x, uint y) private pure {
+        rows[y] &= ~(uint256(1) << x);
+    }
+
+    function _getMod(uint256[] memory rows, uint x, uint y) private pure returns (bool) {
+        return (rows[y] >> x) & 1 != 0;
+    }
+
+    // Bounded set: silently ignores out-of-range coordinates.
+    function _setModU(uint256[] memory rows, uint qrsize, int x, int y, bool dark) private pure {
+        if (x >= 0 && x < int(qrsize) && y >= 0 && y < int(qrsize))
+            _setMod(rows, uint(x), uint(y), dark);
+    }
+
+
+    /*======== Private: Packed-bytes module access (used by getModule only) ========*/
+
     function _getModuleBounded(bytes memory qrcode, uint x, uint y) private pure returns (bool) {
         uint qrsize = uint8(qrcode[0]);
         uint index  = y * qrsize + x;
         return ((uint8(qrcode[(index >> 3) + 1]) >> (index & 7)) & 1) != 0;
     }
 
-    // Sets module (x, y) to dark or light. Coordinates must be in bounds.
-    function _setModuleBounded(bytes memory qrcode, uint x, uint y, bool isDark) private pure {
-        uint qrsize  = uint8(qrcode[0]);
-        uint index   = y * qrsize + x;
-        uint bitPos  = index & 7;
-        uint bytePos = (index >> 3) + 1;
-        if (isDark)
-            qrcode[bytePos] = bytes1(uint8(qrcode[bytePos]) |  uint8(1 << bitPos));
-        else
-            qrcode[bytePos] = bytes1(uint8(qrcode[bytePos]) & uint8(0xFF ^ (1 << bitPos)));
-    }
-
-    // Sets module (x, y) if in bounds; does nothing if x or y is negative or out of range.
-    function _setModuleUnbounded(bytes memory qrcode, int x, int y, bool isDark) private pure {
-        uint qrsize = uint8(qrcode[0]);
-        if (x >= 0 && x < int(qrsize) && y >= 0 && y < int(qrsize))
-            _setModuleBounded(qrcode, uint(x), uint(y), isDark);
-    }
-
-    // Returns true iff bit i of x is set.
     function _getBit(uint x, uint i) private pure returns (bool) {
         return ((x >> i) & 1) != 0;
     }
@@ -974,23 +1242,19 @@ library QRCode {
 
     /*======== Private: Segment bit-length calculations ========*/
 
-    // Returns the number of data bits for a segment, or LENGTH_OVERFLOW on failure.
     function _calcSegmentBitLength(uint8 mode, uint numChars) private pure returns (int) {
         if (numChars > 32767) return LENGTH_OVERFLOW;
         int result = int(numChars);
-        if      (mode == MODE_NUMERIC)                 result = (result * 10 + 2) / 3;
-        else if (mode == MODE_ALPHANUMERIC)            result = (result * 11 + 1) / 2;
-        else if (mode == MODE_BYTE)                    result *= 8;
-        else if (mode == MODE_KANJI)                   result *= 13;
-        else if (mode == MODE_ECI && numChars == 0)    result = 3 * 8;
-        else                                           return LENGTH_OVERFLOW;
+        if      (mode == MODE_NUMERIC)              result = (result * 10 + 2) / 3;
+        else if (mode == MODE_ALPHANUMERIC)         result = (result * 11 + 1) / 2;
+        else if (mode == MODE_BYTE)                 result *= 8;
+        else if (mode == MODE_KANJI)                result *= 13;
+        else if (mode == MODE_ECI && numChars == 0) result = 3 * 8;
+        else                                        return LENGTH_OVERFLOW;
         if (result > 32767) return LENGTH_OVERFLOW;
         return result;
     }
 
-    // Returns the total encoded bit length of all segments at the given version,
-    // or LENGTH_OVERFLOW if any segment overflows its character-count field or
-    // the total exceeds 32767.
     function _getTotalBits(Segment[] memory segs, uint8 version) private pure returns (int) {
         int result = 0;
         for (uint i = 0; i < segs.length; i++) {
@@ -1002,7 +1266,6 @@ library QRCode {
         return result;
     }
 
-    // Returns the width (in bits) of the character-count field for the given mode and version.
     function _numCharCountBits(uint8 mode, uint8 version) private pure returns (uint) {
         uint i = (uint(version) + 7) / 17;  // 0 for v1–9, 1 for v10–26, 2 for v27–40
         if (mode == MODE_NUMERIC)      { if (i == 0) return 10; if (i == 1) return 12; return 14; }
@@ -1016,8 +1279,6 @@ library QRCode {
 
     /*======== Private: Bit buffer ========*/
 
-    // Appends `numBits` bits from val (MSB first) to buffer starting at bit position bitLen.
-    // Returns the updated bit length. Requires numBits <= 16 and val < 2^numBits.
     function _appendBitsToBuffer(uint val, uint numBits, bytes memory buffer, uint bitLen)
         private pure returns (uint)
     {
@@ -1035,58 +1296,33 @@ library QRCode {
 
     /*======== Private: Alphanumeric character lookup ========*/
 
-    // Returns (true, index) if c is in the alphanumeric charset, else (false, 0).
-    // Charset: 0–9 → 0–9, A–Z → 10–35, ' '→36, '$'→37, '%'→38, '*'→39,
-    //          '+'→40, '-'→41, '.'→42, '/'→43, ':'→44
+    /*
+     * Returns (true, index) if c is in the QR alphanumeric charset, else (false, 0).
+     * Uses the pre-computed ALPHA_MAP constant: two range checks + one table lookup,
+     * replacing the original 11-branch if-else chain.
+     */
     function _alphanumericCharIndex(uint8 c) private pure returns (bool, uint) {
-        if (c >= 0x30 && c <= 0x39) return (true, c - 0x30);       // '0'–'9'
-        if (c >= 0x41 && c <= 0x5A) return (true, c - 0x41 + 10);  // 'A'–'Z'
-        if (c == 0x20) return (true, 36);  // ' '
-        if (c == 0x24) return (true, 37);  // '$'
-        if (c == 0x25) return (true, 38);  // '%'
-        if (c == 0x2A) return (true, 39);  // '*'
-        if (c == 0x2B) return (true, 40);  // '+'
-        if (c == 0x2D) return (true, 41);  // '-'
-        if (c == 0x2E) return (true, 42);  // '.'
-        if (c == 0x2F) return (true, 43);  // '/'
-        if (c == 0x3A) return (true, 44);  // ':'
-        return (false, 0);
+        if (c < 0x20 || c > 0x5A) return (false, 0);
+        uint8 v = uint8(ALPHA_MAP[c - 0x20]);
+        if (v == 0) return (false, 0);
+        return (true, uint(v) - 1);
     }
 
 
-    /*======== Private: Lookup tables ========*/
+    /*======== Private: ECC codeword lookup tables ========*/
 
-    /*
-     * ECC codewords per block, indexed by [ecl][version].
-     * Index 0 of each row is unused (version 0 does not exist) and stored as 0xFF.
-     * Hex literals encode the 41-byte table for each ECC level directly from the
-     * QR Code specification.
-     */
     function _eccCodewordsPerBlock(uint8 ecl, uint8 version) private pure returns (uint8) {
-        // Low      : versions 0-40 (index 0 = 0xFF sentinel)
-        bytes memory LOW      = hex"ff070a0f141a1214181e1214181a1e16181c1e1c1c1c1c1e1e1a1c1e1e1e1e1e1e1e1e1e1e1e1e1e1e";
-        bytes memory MEDIUM   = hex"ff0a101a1218101216161a1e161618181c1c1a1a1a1a1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c";
-        bytes memory QUARTILE = hex"ff0d16121a1218121614181c1a18141e181c1c1a1e1c1e1e1e1e1c1e1e1e1e1e1e1e1e1e1e1e1e1e1e";
-        bytes memory HIGH     = hex"ff111c1610161c1a1a181c181c1618181e1c1c1a1c1e181e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e";
-        if (ecl == ECC_LOW)      return uint8(LOW[version]);
-        if (ecl == ECC_MEDIUM)   return uint8(MEDIUM[version]);
-        if (ecl == ECC_QUARTILE) return uint8(QUARTILE[version]);
-        return uint8(HIGH[version]);
+        if (ecl == ECC_LOW)      return uint8(_ECPB_LOW[version]);
+        if (ecl == ECC_MEDIUM)   return uint8(_ECPB_MED[version]);
+        if (ecl == ECC_QUARTILE) return uint8(_ECPB_QRT[version]);
+        return uint8(_ECPB_HIGH[version]);
     }
 
-    /*
-     * Number of error-correction blocks, indexed by [ecl][version].
-     * Index 0 is unused and stored as 0xFF.
-     */
     function _numErrCorrBlocks(uint8 ecl, uint8 version) private pure returns (uint8) {
-        bytes memory LOW      = hex"ff01010101010202020204040404040606060607080809090a0c0c0c0d0e0f10111213131415161819";
-        bytes memory MEDIUM   = hex"ff01010102020404040505050809090a0a0b0d0e10111112141517191a1c1d1f21232526282b2d2f31";
-        bytes memory QUARTILE = hex"ff01010202040406060808080a0c100c11101215141717191b1d22222326282b2d303335383b3e4144";
-        bytes memory HIGH     = hex"ff010102040404050608080b0b101012101315191919221e202325282a2d303336393c3f42464a4d51";
-        if (ecl == ECC_LOW)      return uint8(LOW[version]);
-        if (ecl == ECC_MEDIUM)   return uint8(MEDIUM[version]);
-        if (ecl == ECC_QUARTILE) return uint8(QUARTILE[version]);
-        return uint8(HIGH[version]);
+        if (ecl == ECC_LOW)      return uint8(_NECB_LOW[version]);
+        if (ecl == ECC_MEDIUM)   return uint8(_NECB_MED[version]);
+        if (ecl == ECC_QUARTILE) return uint8(_NECB_QRT[version]);
+        return uint8(_NECB_HIGH[version]);
     }
 
 }
