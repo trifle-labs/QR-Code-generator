@@ -181,7 +181,8 @@ Note: the contracts use `viaIR: true` (Yul IR pipeline) to avoid the EVM's
 License
 -------
 
-Copyright © 2025 Project Nayuki. (MIT License)
+Solidity port and EVM optimizations copyright © trifle-labs contributors. (MIT License)
+Based on the C implementation by Project Nayuki.
 https://www.nayuki.io/page/qr-code-generator-library
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of

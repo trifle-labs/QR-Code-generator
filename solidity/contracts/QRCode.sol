@@ -1,7 +1,8 @@
 /*
  * QR Code generator library (Solidity)
  *
- * Copyright (c) Project Nayuki. (MIT License)
+ * Solidity port and EVM optimizations copyright (c) trifle-labs contributors.
+ * Based on the C implementation by Project Nayuki (MIT License).
  * https://www.nayuki.io/page/qr-code-generator-library
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy of
